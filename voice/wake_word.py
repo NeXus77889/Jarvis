@@ -52,7 +52,7 @@ class VoskWakeWordListener:
         try:
             SetLogLevel(-1)
             model = Model(str(self.model_path))
-            wake_recognizer = KaldiRecognizer(model, 16000, json.dumps(["jarvis"]))
+            wake_recognizer = KaldiRecognizer(model, 16000, json.dumps(["jarvis", "[unk]"]))
             command_recognizer = None
             stream = audio.open(
                 format=pyaudio.paInt16,

@@ -8,7 +8,7 @@ Asistente personal híbrido: el equipo local gestiona sesiones, memoria SQLite y
 - Una clave propia de Groq para las respuestas generativas.
 - Para modo de voz: micrófono, salida de audio y dependencias de voz compatibles con Windows.
 
-La clave que se encontraba en la versión anterior del proyecto debe considerarse comprometida: revóquela en Groq y use una clave nueva. No reutilice la clave anterior.
+
 
 ## Instalación en Windows PowerShell
 
