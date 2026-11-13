@@ -13,8 +13,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VOICE = "es-ES-AlvaroNeural"
-RATE = "+8%"  # un poco más ágil, suena más seguro
+import os
+
+# Se pueden cambiar desde el .env sin tocar el código:
+#   JARVIS_VOICE=es-EC-LuisNeural   JARVIS_VOICE_RATE=+4%   JARVIS_VOICE_PITCH=-3Hz
+DEFAULT_VOICE = "es-EC-LuisNeural"  # acento ecuatoriano, más natural para tu público
+FALLBACK_VOICES = ("es-MX-JorgeNeural", "es-ES-AlvaroNeural")
 
 _stop_event = threading.Event()
 _mixer_lock = threading.Lock()
@@ -44,18 +48,26 @@ def _synthesize(sentence: str) -> Path | None:
     """Genera un MP3 temporal. Devuelve None si no hay red o falla."""
     import edge_tts
 
-    async def generate(target: str) -> None:
-        await edge_tts.Communicate(sentence, VOICE, rate=RATE).save(target)
+    rate = os.getenv("JARVIS_VOICE_RATE", "+3%")
+    pitch = os.getenv("JARVIS_VOICE_PITCH", "-2Hz")
+    voices = (os.getenv("JARVIS_VOICE", DEFAULT_VOICE), *FALLBACK_VOICES)
+
+    async def generate(voice: str, target: str) -> None:
+        await edge_tts.Communicate(sentence, voice, rate=rate, pitch=pitch).save(target)
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
         path = Path(handle.name)
-    try:
-        asyncio.run(generate(str(path)))
-        return path
-    except Exception as exc:
-        path.unlink(missing_ok=True)
-        print(f"No se pudo generar la voz: {type(exc).__name__}: {exc}")
-        return None
+    last_error: Exception | None = None
+    for voice in voices:
+        try:
+            asyncio.run(generate(voice, str(path)))
+            if path.stat().st_size > 0:
+                return path
+        except Exception as exc:  # voz inexistente o sin red: prueba la siguiente
+            last_error = exc
+    path.unlink(missing_ok=True)
+    print(f"No se pudo generar la voz: {type(last_error).__name__}: {last_error}")
+    return None
 
 
 def _ensure_mixer() -> bool:

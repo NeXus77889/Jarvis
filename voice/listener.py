@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import math
+import os
+import threading
 import time
 import unicodedata
+from array import array
 from collections.abc import Callable
 
 EXIT_PHRASES = ("apagate", "desconectate", "adios jarvis")
@@ -13,6 +17,48 @@ LANGUAGE = "es-EC"
 def _normalize(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", text.lower())
     return "".join(c for c in decomposed if not unicodedata.combining(c)).strip()
+
+
+def _rms(data: bytes) -> float:
+    samples = array("h")
+    samples.frombytes(data[: len(data) - len(data) % 2])
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(value * value for value in samples) / len(samples))
+
+
+def _speak_interruptible(text: str, speak: Callable[[str], None], source, recognizer) -> None:
+    """Habla en un hilo y vigila el micrófono: si el usuario habla encima, calla.
+
+    Desactívalo con JARVIS_BARGE_IN=off si con altavoces se interrumpe solo
+    (con audífonos funciona mucho mejor).
+    """
+    from voice.speech import stop_speaking
+
+    thread = threading.Thread(target=speak, args=(text,), daemon=True)
+    thread.start()
+    if os.getenv("JARVIS_BARGE_IN", "on").lower() in {"off", "0", "no"}:
+        thread.join()
+        return
+    echo_peak = 0.0
+    loud = 0
+    started = time.monotonic()
+    while thread.is_alive():
+        try:
+            level = _rms(source.stream.read(source.CHUNK))
+        except Exception:
+            thread.join()
+            return
+        # Los primeros 0.8 s miden cuánto "eco" de su propia voz entra al micrófono.
+        if time.monotonic() - started < 0.8:
+            echo_peak = max(echo_peak, level)
+            continue
+        threshold = max(recognizer.energy_threshold * 2.5, echo_peak * 2.0)
+        loud = loud + 1 if level > threshold else max(0, loud - 1)
+        if loud >= 4:  # ~0.25 s de voz sostenida
+            stop_speaking()
+            break
+    thread.join(timeout=3)
 
 
 def listen_loop(
@@ -50,7 +96,7 @@ def listen_loop(
                         return
                     response = handle_message(text)
                     if response:
-                        speak(response)
+                        _speak_interruptible(response, speak, source, recognizer)
                     # Descarta lo que el micrófono captó mientras Jarvis hablaba.
                     time.sleep(0.25)
                 except sr.WaitTimeoutError:
