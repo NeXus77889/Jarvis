@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JARVIS Core</title>
+<style>
+  :root { --bg: #030101; --hot: #ff5a1f; --warm: #ffb36b; --dim: #8a3512; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); cursor: none; }
+  body { background: radial-gradient(ellipse at 50% 50%, #140703 0%, #070202 48%, #010000 100%); }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #bloom { filter: blur(8px) brightness(1.9); mix-blend-mode: screen; opacity: .95; }
+  #halo { filter: blur(32px) brightness(1.5); mix-blend-mode: screen; opacity: .85; }
+  #hint { position:fixed; z-index:4; left:50%; top:14px; transform:translateX(-50%); color:#d78752; font:10px Consolas,monospace; opacity:.75; pointer-events:none; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="halo"></canvas>
+<canvas id="bloom"></canvas>
+<canvas id="main"></canvas>
+<div id="hint">RUEDA: ACERCAR / ALEJAR · ARRASTRA: EXPLORAR · DOBLE CLIC: CENTRAR</div>
+
+<script>
+"use strict";
+/* ------------------------------------------------------------------
+   Núcleo JARVIS — explorador de espacio profundo.
+   Todo es decorativo salvo lo marcado: hora, modo, volumen de voz,
+   rastreo facial y profundidad de zoom son datos reales.
+   Cuanto más profundo el zoom ("depth" 0..1), más capas de detalle aparecen.
+   Parámetros URL: ?demo=1  ?mode=speaking  ?depth=0.8  ?level=0.6
+   ------------------------------------------------------------------ */
+const TAU = Math.PI * 2;
+const params = new URLSearchParams(location.search);
+const main = document.getElementById("main"), cx = main.getContext("2d");
+const bloom = document.getElementById("bloom"), bx = bloom.getContext("2d");
+const halo = document.getElementById("halo"), hx = halo.getContext("2d");
+
+let W = 0, H = 0, DPR = 1, RPX = 200, U = 1;
+let userDepth = null, zoomOut = 0, routePulse = 0, routeFrom = [0,0], routeTo = [0,0];
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  main.width = Math.round(W * DPR); main.height = Math.round(H * DPR);
+  bloom.width = Math.round(W / 4); bloom.height = Math.round(H / 4);
+  halo.width = Math.round(W / 8); halo.height = Math.round(H / 8);
+  RPX = 0.2 * Math.min(W, H); U = Math.min(W / 1280, H / 720);
+}
+addEventListener("resize", resize); resize();
+
+const LABELS = { idle: "EN ESPERA", listening: "ESCUCHANDO", heard: "ACTIVADO", thinking: "PROCESANDO", speaking: "HABLANDO" };
+const SPIN = { idle: 0.22, listening: 0.45, heard: 1.3, thinking: 1.6, speaking: 0.7 };
+const GLOW = { idle: 0.8, listening: 1.0, heard: 1.25, thinking: 1.15, speaking: 1.05 };
+const S = { mode: "idle", level: 0, depth: 0, spin: 0.22, glow: 0.8, fx: 0, fy: 0, dragX: 0, dragY: 0, handRot: 0, face: false };
+const target = { mode: "idle", level: 0, fx: 0, fy: 0, handZoom: -1, handRot: 0, face: false };
+const forcedDepth = params.has("depth") ? +params.get("depth") : null;
+
+/* ---------- utilidades ---------- */
+const sm = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+function rnd(seed) { let s = seed >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+const R = rnd(11);
+const hash = (a, b) => { let h = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return (h ^ (h >>> 16)) >>> 0; };
+const hex4 = n => ("000" + (n & 0xffff).toString(16)).slice(-4).toUpperCase();
+const mul = (a, b) => [
+  a[0]*b[0]+a[1]*b[3]+a[2]*b[6], a[0]*b[1]+a[1]*b[4]+a[2]*b[7], a[0]*b[2]+a[1]*b[5]+a[2]*b[8],
+  a[3]*b[0]+a[4]*b[3]+a[5]*b[6], a[3]*b[1]+a[4]*b[4]+a[5]*b[7], a[3]*b[2]+a[4]*b[5]+a[5]*b[8],
+  a[6]*b[0]+a[7]*b[3]+a[8]*b[6], a[6]*b[1]+a[7]*b[4]+a[8]*b[7], a[6]*b[2]+a[7]*b[5]+a[8]*b[8]];
+const Rx = a => { const c = Math.cos(a), s = Math.sin(a); return [1,0,0, 0,c,-s, 0,s,c]; };
+const Ry = a => { const c = Math.cos(a), s = Math.sin(a); return [c,0,s, 0,1,0, -s,0,c]; };
+const Rz = a => { const c = Math.cos(a), s = Math.sin(a); return [c,-s,0, s,c,0, 0,0,1]; };
+
+/* ---------- geometría ---------- */
+const N = 4200;
+const px = new Float32Array(N), py = new Float32Array(N), pz = new Float32Array(N);
+const prad = new Float32Array(N), pph = new Float32Array(N), psz = new Float32Array(N);
+const GOLD = Math.PI * (3 - Math.sqrt(5));
+for (let i = 0; i < N; i++) {
+  const shell = R() < 0.72, y = 1 - 2 * (i + 0.5) / N, r = Math.sqrt(1 - y * y), th = i * GOLD;
+  px[i] = Math.cos(th) * r; py[i] = y; pz[i] = Math.sin(th) * r;
+  prad[i] = shell ? 0.96 + R() * 0.06 : 0.35 + R() * 0.6; pph[i] = R(); psz[i] = 0.55 + R() * 1.1;
+}
+/* capa fina interior (aparece al hacer mucho zoom) */
+const NQ = 1500, qx = new Float32Array(NQ), qy = new Float32Array(NQ), qz = new Float32Array(NQ);
+for (let i = 0; i < NQ; i++) {
+  const y = 1 - 2 * (i + 0.5) / NQ, r = Math.sqrt(1 - y * y), th = i * GOLD, k = 0.50 + R() * 0.22;
+  qx[i] = Math.cos(th) * r * k; qy[i] = y * k; qz[i] = Math.sin(th) * r * k;
+}
+/* galaxia lejana */
+const NG = 2600, gx = new Float32Array(NG), gy = new Float32Array(NG), gz = new Float32Array(NG), gb = new Uint8Array(NG);
+for (let i = 0; i < NG; i++) {
+  const arm = i % 3, r = Math.pow(R(), 0.62) * 3.4, a = r * 1.35 + arm * TAU / 3 + (R() - 0.5) * 0.5 * (0.4 + r * 0.25);
+  gx[i] = Math.cos(a) * r; gz[i] = Math.sin(a) * r; gy[i] = (R() - 0.5) * 0.10 * (1.3 - r / 4);
+  gb[i] = r < 0.9 ? 0 : r < 2.0 ? 1 : 2;
+}
+/* campo de estrellas con vuelo */
+const NS = 650, sx3 = new Float32Array(NS), sy3 = new Float32Array(NS), sz3 = new Float32Array(NS), ssz = new Float32Array(NS);
+for (let i = 0; i < NS; i++) { sx3[i] = (R() * 2 - 1) * 4.5; sy3[i] = (R() * 2 - 1) * 3; sz3[i] = (R() * 2 - 1) * 4; ssz[i] = 0.5 + R() * 1.2; }
+
+const PHI = (1 + Math.sqrt(5)) / 2;
+function icosa() {
+  const raw = [[-1,PHI,0],[1,PHI,0],[-1,-PHI,0],[1,-PHI,0],[0,-1,PHI],[0,1,PHI],[0,-1,-PHI],[0,1,-PHI],[PHI,0,-1],[PHI,0,1],[-PHI,0,-1],[-PHI,0,1]];
+  const n = Math.hypot(1, PHI), v = raw.map(p => p.map(c => c / n)), e = [];
+  for (let i = 0; i < 12; i++) for (let j = i + 1; j < 12; j++) {
+    const d = Math.hypot(v[i][0]-v[j][0], v[i][1]-v[j][1], v[i][2]-v[j][2]);
+    if (Math.abs(d - 2 / n) < 1e-6) e.push([i, j]);
+  }
+  return { v, e };
+}
+const ICO = icosa();
+
+/* ---------- cámara ---------- */
+let CAM_D = 5, CAM_F = 1, CX = 0, CY = 0;
+function project(x, y, z, out) {
+  const den = CAM_D - z;
+  if (den < 0.28) return false;
+  const s = CAM_F / den;
+  out[0] = CX + x * s; out[1] = CY - y * s; out[2] = s / RPX; return true;
+}
+const PT = [0, 0, 0], PT2 = [0, 0, 0];
+
+/* ---------- texto ---------- */
+function txt(s, x, y, a, size, align, col) {
+  cx.font = `${size}px Consolas, "Courier New", monospace`; cx.textAlign = align || "left";
+  cx.fillStyle = `rgba(${col || "255,176,110"},${a})`; cx.fillText(s, x, y);
+}
+
+/* ---------- elementos 3D ---------- */
+const BUCKETS = 9, bucketColor = [];
+for (let b = 0; b < BUCKETS; b++) {
+  const k = b / (BUCKETS - 1);
+  bucketColor.push(`rgb(${Math.round(175 + 80 * k)},${Math.round(22 + 105 * k * k)},${Math.round(6 + 36 * k * k * k)})`);
+}
+const bk = new Uint8Array(N), bsx = new Float32Array(N), bsy = new Float32Array(N), bsz = new Float32Array(N);
+
+function drawRing(M, radius, ticks, dashLen, gapLen, t, alpha, width, nodes, deg) {
+  const n = 200, front = new Path2D(), back = new Path2D();
+  const stepRot = Math.floor(t * 6) % (dashLen + gapLen);
+  let pv = null, pvz = 0;
+  for (let i = 0; i <= n; i++) {
+    const a = (i / n) * TAU, lx = Math.cos(a) * radius, ly = Math.sin(a) * radius;
+    const x = M[0]*lx + M[1]*ly, y = M[3]*lx + M[4]*ly, z = M[6]*lx + M[7]*ly;
+    const ok = project(x, y, z, PT), cur = ok ? [PT[0], PT[1]] : null;
+    const dashOn = gapLen === 0 || ((i + stepRot) % (dashLen + gapLen)) < dashLen;
+    if (cur && pv && dashOn) { const p = (z + pvz) > 0 ? front : back; p.moveTo(pv[0], pv[1]); p.lineTo(cur[0], cur[1]); }
+    if (ticks && cur && i % ticks === 0) {
+      const o = 1.07, tx = M[0]*lx*o + M[1]*ly*o, ty = M[3]*lx*o + M[4]*ly*o, tz = M[6]*lx*o + M[7]*ly*o;
+      if (project(tx, ty, tz, PT2)) { const p = z > 0 ? front : back; p.moveTo(cur[0], cur[1]); p.lineTo(PT2[0], PT2[1]); }
+      if (deg > 0.02 && z > 0 && i % (ticks * 5) === 0) txt(String(Math.round(a / TAU * 360)).padStart(3, "0") + "°", PT2[0], PT2[1] - 4, 0.8 * deg * alpha, 9 * U + 2, "center");
+    }
+    pv = cur; pvz = z;
+  }
+  cx.lineWidth = width;
+  cx.strokeStyle = `rgba(255,120,50,${0.24 * alpha})`; cx.stroke(back);
+  cx.strokeStyle = `rgba(255,170,95,${0.95 * alpha})`; cx.stroke(front);
+  /* satélites con etiqueta que orbitan el anillo */
+  if (nodes && nodes.vis > 0.02) {
+    for (const nd of nodes.list) {
+      const a = t * nd.sp + nd.ph, lx = Math.cos(a) * radius, ly = Math.sin(a) * radius;
+      const x = M[0]*lx + M[1]*ly, y = M[3]*lx + M[4]*ly, z = M[6]*lx + M[7]*ly;
+      if (!project(x, y, z, PT)) continue;
+      const v = nodes.vis * (z > -0.2 ? 1 : 0.25);
+      cx.fillStyle = `rgba(255,225,170,${0.95 * v})`;
+      cx.beginPath(); cx.moveTo(PT[0], PT[1] - 4.5); cx.lineTo(PT[0] + 4.5, PT[1]); cx.lineTo(PT[0], PT[1] + 4.5); cx.lineTo(PT[0] - 4.5, PT[1]); cx.fill();
+      if (z > -0.2) {
+        cx.strokeStyle = `rgba(255,150,80,${0.5 * v})`; cx.lineWidth = 1;
+        cx.beginPath(); cx.moveTo(PT[0] + 5, PT[1] - 5); cx.lineTo(PT[0] + 22, PT[1] - 20); cx.lineTo(PT[0] + 52, PT[1] - 20); cx.stroke();
+        txt(nd.name, PT[0] + 26, PT[1] - 24, 0.9 * v, 9 * U + 2);
+        txt(((a % TAU) / TAU * 360).toFixed(1) + "°", PT[0] + 26, PT[1] - 13, 0.55 * v, 8 * U + 2);
+      }
+    }
+  }
+}
+function drawWire(M, size, alpha, nodes) {
+  const pts = ICO.v.map(v => { const x = v[0]*size, y = v[1]*size, z = v[2]*size;
+    const X = M[0]*x+M[1]*y+M[2]*z, Y = M[3]*x+M[4]*y+M[5]*z, Z = M[6]*x+M[7]*y+M[8]*z;
+    return project(X, Y, Z, PT) ? [PT[0], PT[1], Z] : null; });
+  cx.lineWidth = 1; cx.beginPath();
+  for (const [a, b] of ICO.e) { const p = pts[a], q = pts[b]; if (p && q) { cx.moveTo(p[0], p[1]); cx.lineTo(q[0], q[1]); } }
+  cx.strokeStyle = `rgba(255,140,70,${0.5 * alpha})`; cx.stroke();
+  if (nodes) { cx.fillStyle = `rgba(255,210,150,${0.95 * alpha})`; for (const p of pts) if (p) cx.fillRect(p[0] - 1.6, p[1] - 1.6, 3.2, 3.2); }
+}
+const NODES = [
+  { vis: 0, list: [{ ph: 0.4, sp: 0.35, name: "NODO-07" }, { ph: 3.1, sp: 0.35, name: "NODO-12" }] },
+  { vis: 0, list: [{ ph: 1.7, sp: -0.28, name: "SECTOR-A3" }, { ph: 4.4, sp: -0.28, name: "SECTOR-B9" }] },
+  { vis: 0, list: [{ ph: 2.3, sp: 0.2, name: "ÓRBITA-41" }, { ph: 5.2, sp: 0.2, name: "ÓRBITA-58" }, { ph: 0.2, sp: 0.2, name: "ÓRBITA-63" }] },
+];
+
+/* ---------- fondo: nebulosa, galaxia, estrellas ---------- */
+function drawNebula(d) {
+  const blobs = [[0.30, 0.38, 0.55, "150,40,15", 0.12], [0.74, 0.62, 0.50, "110,25,70", 0.09], [0.55, 0.20, 0.42, "180,80,25", 0.06]];
+  for (const [bxn, byn, rn, col, a] of blobs) {
+    const x = W * bxn - S.fx * 22 + Math.sin(T * 0.05 + bxn * 9) * 18, y = H * byn + S.fy * 16 + Math.cos(T * 0.04 + byn * 7) * 14, r = W * rn;
+    const g = cx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(${col},${a * (0.9 + 0.5 * d)})`); g.addColorStop(1, `rgba(${col},0)`);
+    cx.fillStyle = g; cx.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+}
+const GCOL = ["255,215,160", "255,120,55", "190,60,60"];
+const gsx = new Float32Array(NG), gsy = new Float32Array(NG), gok = new Uint8Array(NG);
+function drawGalaxy(world, a) {
+  if (a < 0.01) return;
+  const M = mul(world, mul(Rx(1.08), Ry(T * 0.025)));
+  for (let i = 0; i < NG; i++) {
+    const x = M[0]*gx[i] + M[1]*gy[i] + M[2]*gz[i], y = M[3]*gx[i] + M[4]*gy[i] + M[5]*gz[i], z = M[6]*gx[i] + M[7]*gy[i] + M[8]*gz[i];
+    gok[i] = project(x, y - 0.0, z - 1.5, PT) ? 1 : 0; gsx[i] = PT[0]; gsy[i] = PT[1];
+  }
+  for (let b = 0; b < 3; b++) {
+    cx.fillStyle = `rgba(${GCOL[b]},${a * (b === 0 ? 0.9 : b === 1 ? 0.5 : 0.35)})`;
+    for (let i = 0; i < NG; i++) if (gok[i] && gb[i] === b) cx.fillRect(gsx[i], gsy[i], 1.3, 1.3);
+  }
+}
+let flight = 0;
+function drawStars(dt, a, speed) {
+  flight += dt * (0.04 + speed * 2.4);
+  for (let i = 0; i < NS; i++) {
+    const z = ((sz3[i] + flight + 4) % 8) - 4, ps = Math.max(0, speed) * 0.12;
+    if (!project(sx3[i], sy3[i], z * 0.6, PT)) continue;
+    const near = Math.min(1, Math.max(0.15, (z + 4) / 8));
+    cx.fillStyle = `rgba(255,${200 + near * 40 | 0},${170 + near * 60 | 0},${a * (0.25 + near * 0.6)})`;
+    const sz = ssz[i] * (0.6 + near * 1.3);
+    if (ps > 0.01 && project(sx3[i], sy3[i], (z - ps * 4) * 0.6, PT2)) {
+      cx.strokeStyle = cx.fillStyle; cx.lineWidth = sz * 0.7; cx.beginPath(); cx.moveTo(PT2[0], PT2[1]); cx.lineTo(PT[0], PT[1]); cx.stroke();
+    } else cx.fillRect(PT[0], PT[1], sz, sz);
+  }
+}
+
+/* ---------- HUD de pantalla: paneles, reglas, retícula ---------- */
+const hist = new Array(72).fill(0);
+function box(x, y, w, h, a, title) {
+  cx.fillStyle = `rgba(30,8,3,${0.38 * a})`; cx.fillRect(x, y, w, h);
+  cx.lineWidth = 1; cx.strokeStyle = `rgba(255,120,60,${0.32 * a})`; cx.strokeRect(x + 0.5, y + 0.5, w, h);
+  const c = 11 * U + 3; cx.strokeStyle = `rgba(255,195,135,${0.95 * a})`; cx.beginPath();
+  cx.moveTo(x, y + c); cx.lineTo(x, y); cx.lineTo(x + c, y);
+  cx.moveTo(x + w - c, y + h); cx.lineTo(x + w, y + h); cx.lineTo(x + w, y + h - c); cx.stroke();
+  txt(title, x + 10 * U, y + 15 * U + 2, 0.95 * a, 10 * U + 2);
+  cx.strokeStyle = `rgba(255,120,60,${0.35 * a})`; cx.beginPath(); cx.moveTo(x + 8 * U, y + 22 * U + 2); cx.lineTo(x + w - 8 * U, y + 22 * U + 2); cx.stroke();
+}
+function pSpectrum(x, y, w, h, a) {
+  const n = 30, bw = (w - 20 * U) / n, base = y + h - 10 * U, maxh = h - 40 * U;
+  for (let k = 0; k < n; k++) {
+    const v = Math.min(1, (0.07 + S.level * 0.95) * (0.3 + 0.7 * Math.abs(Math.sin(T * 3.1 + k * 0.63) * Math.cos(T * 1.7 + k * 0.31))));
+    cx.fillStyle = `rgba(255,${110 + v * 90 | 0},60,${0.85 * a})`; cx.fillRect(x + 10 * U + k * bw, base - v * maxh, bw - 2, v * maxh);
+  }
+}
+function pHex(x, y, w, h, a) {
+  const rows = Math.floor((h - 34 * U) / (13 * U + 1)), f = Math.floor(T * 3);
+  for (let r = 0; r < rows; r++) {
+    const line = `0x${hex4(hash(r, 7))}  ${hex4(hash(r + f, 1))} ${hex4(hash(r + f, 2))} ${hex4(hash(r + f * 2, 3))}`;
+    txt(line, x + 10 * U, y + 38 * U + r * (13 * U + 1), (0.45 + 0.4 * ((r + f) % 3 === 0)) * a, 9 * U + 2);
+  }
+}
+function pScope(x, y, w, h, a) {
+  const mid = y + h * 0.58, amp = (h - 44 * U) * 0.5;
+  cx.strokeStyle = `rgba(255,120,60,${0.2 * a})`; cx.beginPath(); cx.moveTo(x + 8 * U, mid); cx.lineTo(x + w - 8 * U, mid); cx.stroke();
+  cx.strokeStyle = `rgba(255,185,120,${0.95 * a})`; cx.lineWidth = 1.4; cx.beginPath();
+  const n = hist.length;
+  for (let i = 0; i < n; i++) {
+    const px_ = x + 8 * U + (i / (n - 1)) * (w - 16 * U), v = (0.06 + hist[i]) * Math.sin(i * 0.9 + T * 9) * amp;
+    i ? cx.lineTo(px_, mid - v) : cx.moveTo(px_, mid - v);
+  }
+  cx.stroke(); cx.lineWidth = 1;
+}
+function pGauge(x, y, w, h, a) {
+  const gcx = x + w * 0.32, gcy = y + h * 0.6, r = Math.min(w * 0.24, h * 0.34);
+  for (let i = 0; i < 3; i++) {
+    const rr = r - i * 9 * U, a0 = T * (0.8 + i * 0.5) * (i % 2 ? -1 : 1);
+    cx.strokeStyle = `rgba(255,${150 + i * 25},${90 + i * 20},${(0.9 - i * 0.2) * a})`; cx.lineWidth = 2;
+    cx.beginPath(); cx.arc(gcx, gcy, rr, a0, a0 + 3.6 - i * 0.7); cx.stroke();
+  }
+  cx.lineWidth = 1;
+  txt(Math.round(S.depth * 100) + "%", gcx, gcy + 5, 0.95 * a, 15 * U + 3, "center");
+  txt("PROFUNDIDAD", x + w * 0.62, y + h * 0.45, 0.8 * a, 9 * U + 2);
+  txt("ESCALA 1:" + (1 + Math.round(S.depth * 46)), x + w * 0.62, y + h * 0.6, 0.55 * a, 9 * U + 2);
+}
+function pLink(x, y, w, h, a) {
+  const rows = [["VOZ", LABELS[S.mode] || "EN ESPERA"], ["CÁMARA", S.face ? "RASTREANDO" : "SIN ROSTRO"], ["NÚCLEO", "ESTABLE"], ["ENLACE", "ACTIVO"], ["HORA", new Date().toLocaleTimeString("es-EC", { hour12: false })]];
+  rows.forEach((r, i) => { const yy = y + 40 * U + i * 15 * U; txt(r[0], x + 10 * U, yy, 0.6 * a, 9 * U + 2); txt(r[1], x + w - 10 * U, yy, 0.95 * a, 9 * U + 2, "right"); });
+}
+function pCoords(x, y, w, h, a) {
+  const f = n => (n >= 0 ? "+" : "−") + Math.abs(n).toFixed(3).padStart(7, "0");
+  const X = S.face ? S.fx : Math.sin(T * 0.31), Y = S.face ? S.fy : Math.cos(T * 0.27), Z = Math.sin(T * 0.13);
+  [["X", X], ["Y", Y], ["Z", Z]].forEach((c, i) => { txt(c[0], x + 10 * U, y + 42 * U + i * 17 * U, 0.6 * a, 10 * U + 2); txt(f(c[1]), x + w - 10 * U, y + 42 * U + i * 17 * U, 0.95 * a, 10 * U + 2, "right"); });
+  txt("FASE " + (T * 12 % 360).toFixed(1) + "°", x + 10 * U, y + h - 10 * U, 0.5 * a, 9 * U + 2);
+}
+const PANELS = [
+  { side: -1, row: 0, th: 0.26, title: "ESPECTRO DE VOZ", fn: pSpectrum },
+  { side: 1, row: 0, th: 0.34, title: "OSCILOSCOPIO", fn: pScope },
+  { side: -1, row: 1, th: 0.50, title: "FLUJO DE DATOS", fn: pHex },
+  { side: 1, row: 1, th: 0.60, title: "SECTOR / PROFUNDIDAD", fn: pGauge },
+  { side: -1, row: 2, th: 0.74, title: "COORDENADAS", fn: pCoords },
+  { side: 1, row: 2, th: 0.84, title: "ESTADO DEL SISTEMA", fn: pLink },
+];
+function drawPanels(d) {
+  const pw = Math.max(190, Math.min(270, W * 0.2)), ph = 128 * U + 20;
+  const top = 78 * U + 10, gap = 14 * U;
+  for (const p of PANELS) {
+    const a = sm(p.th, p.th + 0.13, d); if (a < 0.01) continue;
+    const x = (p.side < 0 ? 26 * U : W - 26 * U - pw) + p.side * (1 - a) * 46 * U - S.fx * 10 * U;
+    const y = top + p.row * (ph + gap) + S.fy * 6 * U;
+    box(x, y, pw, ph, a, p.title); p.fn(x, y, pw, ph, a);
+  }
+}
+function drawReticle(rc, d) {
+  const a = sm(0.42, 0.6, d); if (a < 0.01) return;
+  const r = rc * 1.16;
+  cx.lineWidth = 1;
+  for (let i = 0; i < 120; i++) {
+    const ang = i / 120 * TAU + T * 0.05, len = i % 10 === 0 ? 11 : i % 5 === 0 ? 7 : 3.5;
+    cx.strokeStyle = `rgba(255,170,100,${(i % 10 === 0 ? 0.85 : 0.4) * a})`;
+    cx.beginPath(); cx.moveTo(CX + Math.cos(ang) * r, CY + Math.sin(ang) * r); cx.lineTo(CX + Math.cos(ang) * (r + len), CY + Math.sin(ang) * (r + len)); cx.stroke();
+    if (i % 10 === 0 && d > 0.62) txt(String(Math.round(i * 3)).padStart(3, "0"), CX + Math.cos(ang) * (r + 24), CY + Math.sin(ang) * (r + 24) + 3, 0.7 * a * sm(0.62, 0.78, d), 9 * U + 2, "center");
+  }
+  const sw = sm(0.66, 0.85, d);
+  if (sw > 0.01) {
+    const ang = T * 1.4, g = cx.createConicGradient ? cx.createConicGradient(ang - 1.1, CX, CY) : null;
+    if (g) { g.addColorStop(0, "rgba(255,120,50,0)"); g.addColorStop(0.17, `rgba(255,140,70,${0.28 * sw})`); g.addColorStop(0.175, "rgba(255,140,70,0)"); g.addColorStop(1, "rgba(255,120,50,0)");
+      cx.fillStyle = g; cx.beginPath(); cx.arc(CX, CY, r - 2, 0, TAU); cx.arc(CX, CY, r * 0.62, 0, TAU, true); cx.fill("evenodd"); }
+    cx.strokeStyle = `rgba(255,210,150,${0.8 * sw})`; cx.beginPath(); cx.moveTo(CX + Math.cos(ang) * r * 0.62, CY + Math.sin(ang) * r * 0.62); cx.lineTo(CX + Math.cos(ang) * r, CY + Math.sin(ang) * r); cx.stroke();
+  }
+  /* cruz de mira */
+  cx.strokeStyle = `rgba(255,170,100,${0.5 * a})`; const c = 16 * U;
+  cx.beginPath(); cx.moveTo(CX - c, CY); cx.lineTo(CX - 5, CY); cx.moveTo(CX + 5, CY); cx.lineTo(CX + c, CY); cx.moveTo(CX, CY - c); cx.lineTo(CX, CY - 5); cx.moveTo(CX, CY + 5); cx.lineTo(CX, CY + c); cx.stroke();
+}
+function drawRoutes(d) {
+  if (d < 0.16) return;
+  const a=sm(0.16,0.34,d)*(0.48+0.28*Math.sin(T*2));
+  const nodes=[[W*.13,H*.27],[W*.84,H*.24],[W*.18,H*.76],[W*.82,H*.73],[W*.5,H*.12],[W*.5,H*.86]];
+  for(let i=0;i<nodes.length;i++){const [x,y]=nodes[i],p=(Math.sin(T*2+i*1.7)+1)/2;cx.strokeStyle=`rgba(255,145,75,${a*.4})`;cx.beginPath();cx.moveTo(CX,CY);cx.lineTo(x,y);cx.stroke();cx.fillStyle=`rgba(255,190,130,${a*(.5+p*.4)})`;cx.beginPath();cx.arc(x,y,2+p*2,0,TAU);cx.fill();}
+  if(routePulse>T){const p=Math.min(1,(T-(routePulse-1.1))/.8),x=routeFrom[0]+(routeTo[0]-routeFrom[0])*p,y=routeFrom[1]+(routeTo[1]-routeFrom[1])*p;cx.strokeStyle=`rgba(255,185,115,${.9*(1-p*.4)})`;cx.lineWidth=1.5;cx.beginPath();cx.moveTo(routeFrom[0],routeFrom[1]);cx.lineTo(x,y);cx.stroke();cx.fillStyle="#ffd4a4";cx.beginPath();cx.arc(x,y,3,0,TAU);cx.fill();}
+}
+function drawOuterFlow(amount) {
+  if(amount<.015)return;
+  const a=Math.min(1,amount),base=Math.min(W,H)*(.16+a*.11),count=2+Math.floor(a*15);
+  cx.save();cx.globalAlpha=a;
+  for(let i=0;i<count;i++){
+    const r=base+i*Math.min(W,H)*(.025+a*.008),spin=T*(i%2?-.08:.055)+(i/count)*TAU,rx=r*(1+.16*Math.sin(T*.3+i)),ry=r*(.48+.12*Math.cos(T*.22+i));
+    cx.beginPath();cx.ellipse(CX,CY,rx,ry,spin,.15+i*.17+T*.08,.15+i*.17+T*.08+Math.PI*(1.15+(i%3)*.2));cx.strokeStyle=`rgba(255,${130+i%3*28},${75+i%2*25},${.25+.28*(i/count)})`;cx.lineWidth=i%4===0?1.5:0.8;cx.stroke();
+  }
+  const spokes=8+Math.floor(a*26);
+  for(let i=0;i<spokes;i++){
+    const ang=i/spokes*TAU+T*.035*(i%2?1:-1),r1=base*.68,r2=base+count*Math.min(W,H)*(.025+a*.008),pulse=.5+.5*Math.sin(T*2+i);
+    cx.strokeStyle=`rgba(255,175,115,${(.14+.24*pulse)*a})`;cx.lineWidth=.7+(i%6===0?1:0);cx.beginPath();cx.moveTo(CX+Math.cos(ang)*r1,CY+Math.sin(ang)*r1*.62);cx.lineTo(CX+Math.cos(ang+.05*Math.sin(T+i))*r2,CY+Math.sin(ang+.05*Math.sin(T+i))*r2*.62);cx.stroke();
+    const nx=CX+Math.cos(ang)*r2,ny=CY+Math.sin(ang)*r2*.62;cx.fillStyle=`rgba(255,210,160,${.3+.55*pulse})`;cx.fillRect(nx-1,ny-1,2,2);
+  }
+  cx.restore();
+}
+function drawDeepOverlays(d) {
+  const terminal=(x,y,w,h,title,kind,alpha)=>{
+    cx.save();cx.globalAlpha=alpha;cx.fillStyle="rgba(8,3,2,.34)";cx.fillRect(x,y,w,h);cx.strokeStyle="rgba(255,160,100,.72)";cx.strokeRect(x+.5,y+.5,w-1,h-1);
+    txt(title,x+8*U,y+14*U,.95,9*U+1);cx.strokeStyle="rgba(255,135,75,.48)";cx.beginPath();cx.moveTo(x+7*U,y+20*U);cx.lineTo(x+w-7*U,y+20*U);cx.stroke();
+    if(kind==="stats"){
+      const p=Math.round(32+28*Math.abs(Math.sin(T*.8))),m=(38+21*Math.abs(Math.cos(T*.53))).toFixed(1),disk=(64+13*Math.abs(Math.sin(T*.31))).toFixed(1);
+      ["PROCESAMIENTO  "+p+"%","MEMORIA        "+m+"%","DISCO          "+disk+"%","NODO           0x"+hex4(hash(Math.floor(T*3),7))].forEach((s,i)=>txt(s,x+9*U,y+34*U+i*13*U,.85,9*U+1));
+      const rows=Math.floor((h-90*U)/(11*U));for(let r=0;r<rows;r++)txt(["> decodificando paquete 0x"+hex4(hash(r+Math.floor(T*5),4)),"> buffer.sync("+hash(r,Math.floor(T*4)).toString(2).slice(-12)+");","> ruta establecida // sector "+(r*17%99)][r%3],x+9*U,y+92*U+r*11*U,.67,8*U+1);
+    }else{
+      const cols=Math.max(8,Math.floor((w-16*U)/(7*U))),rows=Math.floor((h-28*U)/(11*U));
+      for(let r=0;r<rows;r++){let bits="";for(let c=0;c<cols;c++)bits+=hash(r+Math.floor(T*5),c+Math.floor(T*2)).toString(2).slice(-1);txt(bits,x+8*U,y+33*U+r*11*U,.58+.32*((r+Math.floor(T*5))%4===0),8*U+1);}
+    }cx.restore();
+  };
+  if(d>.94){
+    cx.fillStyle=`rgba(3,1,1,${sm(.94,1,d)*.97})`;cx.fillRect(0,0,W,H);
+    const step=Math.max(12,Math.round(17*U)),cols=Math.ceil(W/(step*1.7));
+    for(let c=0;c<cols;c++){const x=(c+.5)*W/cols,offset=(T*45+c*31)%(H+180);for(let r=0;r<15;r++){const y=(offset-r*step+H+180)%(H+180)-90;txt(hash(r+Math.floor(T*4),c).toString(2).padStart(8,"0").slice(-8),x,y,.16+.22*(1-r/15),8*U+1,"center");}}
+    for(let i=0;i<18;i++){const a=T*.35+i*TAU/18,r=70+((T*34+i*97)%(Math.min(W,H)*.42));cx.strokeStyle=`rgba(255,140,75,${.12+.12*Math.sin(T+i)})`;cx.beginPath();cx.moveTo(CX+Math.cos(a)*r,CY+Math.sin(a)*r);cx.lineTo(CX+Math.cos(a+1.1)*Math.min(W,H)*.48,CY+Math.sin(a+1.1)*Math.min(W,H)*.48);cx.stroke();}
+    cx.globalAlpha=sm(.94,1,d);txt("NÚCLEO // FLUJO DE DATOS",W/2,36*U,.7,11*U+1,"center");cx.globalAlpha=1;return;
+  }
+  const reveal=sm(.30,.46,d), inner=sm(.53,.68,d);
+  if(reveal>.01){const w=Math.min(260*U,W*.28),h=Math.min(142*U,H*.26),x=CX-w*.52,y=CY-h*.55;cx.strokeStyle=`rgba(255,165,100,${.65*reveal})`;cx.beginPath();cx.moveTo(CX-5*U,CY-4*U);cx.lineTo(x+w*.5,y+h);cx.stroke();terminal(x,y,w,h,"PAQUETE // 0x"+hex4(hash(Math.floor(T*4),2)),"binary",reveal);}
+  if(inner>.01){const w=Math.min(390*U,W*.40),h=Math.min(250*U,H*.44),x=CX+w*.12,y=CY-h*.48;cx.strokeStyle=`rgba(255,165,100,${.72*inner})`;cx.beginPath();cx.moveTo(CX+4*U,CY);cx.lineTo(x,y+h*.58);cx.stroke();terminal(x,y,w,h,"ÍNDICE DE PROCESAMIENTO","stats",inner);}
+  const deep=sm(.72,.90,d);if(deep>.01){const w=Math.min(350*U,W*.37),h=Math.min(150*U,H*.28),x=CX-w*.53,y=CY+h*.65;cx.strokeStyle=`rgba(255,165,100,${.65*deep})`;cx.beginPath();cx.moveTo(CX-8*U,CY+5*U);cx.lineTo(x+w,y+h*.45);cx.stroke();terminal(x,y,w,h,"SUBCAPA BINARIA // STREAM","binary",deep);}
+}
+function drawFrameHud(d) {
+  const m = 18 * U + 4, L = 44 * U, a = sm(0.30, 0.46, d);
+  if (a > 0.01) {
+    cx.strokeStyle = `rgba(255,185,120,${0.8 * a})`; cx.lineWidth = 1.5; cx.beginPath();
+    cx.moveTo(m, m + L); cx.lineTo(m, m); cx.lineTo(m + L, m);
+    cx.moveTo(W - m - L, m); cx.lineTo(W - m, m); cx.lineTo(W - m, m + L);
+    cx.moveTo(m, H - m - L); cx.lineTo(m, H - m); cx.lineTo(m + L, H - m);
+    cx.moveTo(W - m - L, H - m); cx.lineTo(W - m, H - m); cx.lineTo(W - m, H - m - L); cx.stroke(); cx.lineWidth = 1;
+  }
+  /* regla inferior tipo telescopio, se desplaza con el zoom */
+  const r = sm(0.18, 0.36, d);
+  if (r > 0.01) {
+    const y = H - 76 * U, step = 14 * U, off = (flight * 90) % step;
+    cx.strokeStyle = `rgba(255,150,80,${0.45 * r})`; cx.beginPath(); cx.moveTo(m + L, y); cx.lineTo(W - m - L, y);
+    for (let x = m + L - off; x < W - m - L; x += step) { if (x < m + L) continue; const big = Math.round((x + off) / step) % 5 === 0; cx.moveTo(x, y); cx.lineTo(x, y - (big ? 9 : 4)); } cx.stroke();
+    txt("AMPLIACIÓN ×" + (5 / Math.max(CAM_D, 0.55)).toFixed(1), m + L, y + 16 * U, 0.85 * r, 10 * U + 2);
+    txt("RA " + (14 + Math.sin(T * 0.1) * 0.4).toFixed(2) + "h   DEC −" + (62 + Math.cos(T * 0.08) * 0.7).toFixed(2) + "°", W - m - L, y + 16 * U, 0.6 * r, 10 * U + 2, "right");
+  }
+}
+function drawInnerShell(M, a, spdBoost) {
+  if (a < 0.02) return;
+  const M2 = mul(M, Ry(-T * 0.5 * spdBoost));
+  cx.fillStyle = `rgba(255,205,150,${0.75 * a})`;
+  for (let i = 0; i < NQ; i++) {
+    const x = M2[0]*qx[i] + M2[1]*qy[i] + M2[2]*qz[i], y = M2[3]*qx[i] + M2[4]*qy[i] + M2[5]*qz[i], z = M2[6]*qx[i] + M2[7]*qy[i] + M2[8]*qz[i];
+    if (project(x, y, z, PT)) cx.fillRect(PT[0], PT[1], 1.4, 1.4);
+  }
+}
+
+/* ---------- bucle principal ---------- */
+let last = performance.now(), T = 0, prevDepth = 0;
+function depthFor(mode) {
+  if (forcedDepth !== null) return forcedDepth;
+  if (userDepth !== null) return Math.max(0,Math.min(1,userDepth));
+  if (target.handZoom >= 0) return target.handZoom;
+  switch (mode) {
+    case "listening": return 0.22;
+    case "heard": case "thinking": return 0.95;
+    /* al hablar, el zoom viaja solo: entra y sale revelando y ocultando capas */
+    case "speaking": return 0.60 + 0.36 * Math.sin(T * 0.42 - 0.9);
+    default: return 0.04 + 0.04 * Math.sin(T * 0.3);
+  }
+}
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; T += dt;
+  const mode = target.mode in LABELS ? target.mode : "idle";
+  const k = 1 - Math.exp(-dt * 5);
+  S.level += (target.level - S.level) * (1 - Math.exp(-dt * (target.level > S.level ? 22 : 9)));
+  S.depth += (depthFor(mode) - S.depth) * (1 - Math.exp(-dt * (mode === "speaking" ? 1.7 : 2.8)));
+  S.spin += (SPIN[mode] - S.spin) * k; S.glow += (GLOW[mode] - S.glow) * k;
+  S.fx += (target.fx - S.fx) * k; S.fy += (target.fy - S.fy) * k; S.dragX += (dragRotationX - S.dragX) * k; S.dragY += (dragRotationY - S.dragY) * k; S.handRot += (target.handRot - S.handRot) * k;
+  S.mode = mode; S.face = target.face;
+  const d = S.depth, speed = (d - prevDepth) / Math.max(dt, 0.001); prevDepth = d;
+  zoomOut = userDepth === null ? 0 : Math.max(0,Math.min(1,-userDepth));
+
+  CAM_D = 5.0 - d * 4.45 + zoomOut * 36; CAM_F = RPX * 5.0;
+  CX = W / 2 - S.fx * W * 0.035; CY = H / 2 + S.fy * H * 0.03;
+  const lvl = Math.min(1, S.level), breath = 1 + 0.028 * Math.sin(T * 1.7) + lvl * 0.16;
+  const world = mul(Rx(-S.fy * 0.30 + S.dragY), Ry(S.fx * 0.45 + S.dragX));
+  const obj = mul(Rx(0.38 + 0.05 * Math.sin(T * 0.4)), Ry(T * S.spin + S.handRot));
+  const M = mul(world, obj);
+  hist.push(lvl); hist.shift();
+  for (const nd of NODES) nd.vis = 0;
+  NODES[0].vis = sm(0.22, 0.4, d); NODES[1].vis = sm(0.4, 0.56, d); NODES[2].vis = sm(0.56, 0.72, d);
+  const degV = sm(0.5, 0.7, d);
+
+  cx.setTransform(DPR, 0, 0, DPR, 0, 0); cx.clearRect(0, 0, W, H);
+  cx.globalCompositeOperation = "lighter";
+
+  drawNebula(d);
+  drawOuterFlow(zoomOut);
+  drawGalaxy(world, 0.9 * (1 - sm(0.12, 0.62, d)) + 0.12);
+  drawStars(dt, 0.9, Math.abs(speed) * 0.5 + d * 0.05);
+
+  drawWire(mul(world, mul(Ry(-T * 0.18 * (1 + S.spin)), Rx(T * 0.11 + 0.6))), 1.34, 0.9, true);
+  drawWire(mul(world, mul(Rz(T * 0.07), mul(Rx(-T * 0.09), Ry(T * 0.13)))), 1.95, 0.55, false);
+  const sp = 1 + S.spin * 0.8;
+  drawRing(mul(world, mul(Rx(1.25 + T * 0.12 * sp), Ry(0.2 + T * 0.07 * sp))), 1.62, 5, 14, 0, T, 1.0, 1.3, null, 0);
+  drawRing(mul(world, mul(Rx(0.35 - T * 0.09 * sp), Ry(1.0 + T * 0.16 * sp))), 1.88, 0, 11, 7, T, 0.9, 2.0, NODES[0], 0);
+  drawRing(mul(world, mul(Rz(0.5 + T * 0.05 * sp), Rx(1.45 + T * 0.1 * sp))), 2.30, 10, 30, 0, T, 0.7, 1.0, NODES[2], degV);
+  drawRing(mul(world, mul(Rx(-0.5 + T * 0.06 * sp), Ry(-T * 0.14 * sp))), 1.30, 0, 6, 5, T, 0.85, 1.4, NODES[1], 0);
+
+  /* núcleo de partículas */
+  const nb = new Array(BUCKETS).fill(0), glowBoost = 0.25 * lvl;
+  for (let i = 0; i < N; i++) {
+    const kk = prad[i] * (breath + lvl * 0.34 * Math.sin(T * 9 + pph[i] * TAU) * (0.4 + pph[i]));
+    const x0 = px[i] * kk, y0 = py[i] * kk, z0 = pz[i] * kk;
+    const x = M[0]*x0 + M[1]*y0 + M[2]*z0, y = M[3]*x0 + M[4]*y0 + M[5]*z0, z = M[6]*x0 + M[7]*y0 + M[8]*z0;
+    if (!project(x, y, z, PT)) { bk[i] = 255; continue; }
+    let b = 0.30 + 0.70 * (z + 1.1) / 2.2 + glowBoost; b = b < 0 ? 0 : b > 1 ? 1 : b;
+    const bi = Math.min(BUCKETS - 1, (b * (BUCKETS - 1) + 0.5) | 0);
+    bk[i] = bi; bsx[i] = PT[0]; bsy[i] = PT[1]; bsz[i] = psz[i] * Math.min(2.0, 0.7 + PT[2] * 0.55); nb[bi]++;
+  }
+  for (let b = 0; b < BUCKETS; b++) {
+    if (!nb[b]) continue; cx.fillStyle = bucketColor[b];
+    for (let i = 0; i < N; i++) if (bk[i] === b) { const s = bsz[i]; cx.fillRect(bsx[i] - s / 2, bsy[i] - s / 2, s, s); }
+  }
+  drawInnerShell(M, sm(0.62, 0.85, d) * (0.7 + 0.5 * lvl), sp);
+
+  /* corazón de energía */
+  project(0, 0, 0, PT);
+  const rc = CAM_F / CAM_D;                      // radio del núcleo en pantalla
+  const gr = rc * (0.95 + lvl * 0.5);
+  const g = cx.createRadialGradient(PT[0], PT[1], 0, PT[0], PT[1], gr * 1.3), ga = (0.20 + 0.42 * lvl) * S.glow;
+  g.addColorStop(0, `rgba(255,150,80,${ga})`); g.addColorStop(0.35, `rgba(255,60,20,${ga * 0.6})`); g.addColorStop(1, "rgba(255,60,10,0)");
+  cx.fillStyle = g; cx.fillRect(PT[0] - gr * 1.3, PT[1] - gr * 1.3, gr * 2.6, gr * 2.6);
+
+  cx.globalCompositeOperation = "source-over";
+  const outerHud=1-sm(.82,.94,d);cx.globalAlpha=outerHud;
+  drawReticle(rc, d); drawFrameHud(d); drawPanels(d);drawRoutes(d);
+  cx.globalAlpha=1;
+  drawDeepOverlays(d);
+
+  /* título y estado (siempre visibles) */
+  cx.globalAlpha=outerHud;
+  txt("J.A.R.V.I.S  //  NÚCLEO", 32 * U + 4, 36 * U + 4, 0.85, 12 * U + 2, "left", "255,110,50");
+  txt(new Date().toLocaleTimeString("es-EC", { hour12: false }), W - 32 * U - 4, 36 * U + 4, 0.7, 12 * U + 2, "right");
+  txt("—  " + LABELS[mode] + "  —", W / 2, H - 34 * U - 2, 0.85, 13 * U + 2, "center");
+  if (netMsg) txt(netMsg, W - 32 * U - 4, H - 34 * U - 2, 0.45, 9 * U + 2, "right");
+  cx.globalAlpha=1;
+
+  bx.clearRect(0, 0, bloom.width, bloom.height); bx.drawImage(main, 0, 0, bloom.width, bloom.height);
+  hx.clearRect(0, 0, halo.width, halo.height); hx.drawImage(main, 0, 0, halo.width, halo.height);
+  requestAnimationFrame(frame);
+}
+
+/* ---------- estado: servidor local o demostración ---------- */
+let fails = 0, demo = params.has("demo"), forced = params.get("mode"), netMsg = "";
+async function poll() {
+  if (demo) return;
+  try {
+    const r = await fetch("/state", { cache: "no-store" }), s = await r.json(); fails = 0;
+    target.mode = s.mode in LABELS ? s.mode : "idle"; target.level = +s.level || 0;
+    target.face = !!s.face; target.fx = s.face ? +s.face_x || 0 : 0; target.fy = s.face ? +s.face_y || 0 : 0;
+    target.handZoom = s.hand_zoom == null ? -1 : +s.hand_zoom; target.handRot = +s.hand_rot || 0;
+    netMsg = s.face ? "RASTREO FACIAL ACTIVO" : "";
+  } catch (e) { if (++fails > 12) { demo = true; netMsg = "MODO DEMOSTRACIÓN"; } }
+}
+setInterval(poll, 40);
+if (forced) { demo = true; target.mode = forced; target.level = +(params.get("level") || 0); }
+const SEQ = [["idle", 4], ["listening", 3], ["thinking", 4], ["speaking", 14]];
+let dragging=false,lastPointer=null,dragRotationX=0,dragRotationY=0;
+main.addEventListener("wheel",e=>{e.preventDefault();userDepth=Math.max(-1,Math.min(1,(userDepth??S.depth)+(e.deltaY<0?.02:-.02)));target.handZoom=Math.max(0,userDepth);const nodes=[[W*.13,H*.27],[W*.84,H*.24],[W*.18,H*.76],[W*.82,H*.73],[W*.5,H*.12],[W*.5,H*.86]],n=nodes[Math.floor(Math.random()*nodes.length)];routeFrom=[e.clientX,e.clientY];routeTo=n;routePulse=T+1.1;netMsg=userDepth<0?"CAMPO ORBITAL ×"+(1+zoomOut*35).toFixed(1):"AMPLIACIÓN ×"+(1+userDepth*160).toFixed(1);},{passive:false});
+main.addEventListener("pointerdown",e=>{dragging=true;lastPointer=[e.clientX,e.clientY];main.setPointerCapture(e.pointerId)});
+main.addEventListener("pointerup",()=>{dragging=false;lastPointer=null});
+main.addEventListener("pointermove",e=>{if(dragging&&lastPointer){dragRotationX+=(e.clientX-lastPointer[0])/W*TAU;dragRotationY+=(e.clientY-lastPointer[1])/H*TAU;lastPointer=[e.clientX,e.clientY];}else if(demo){target.fx=(e.clientX/W-.5)*2;target.fy=(e.clientY/H-.5)*2;target.face=true;}});
+main.addEventListener("dblclick",()=>{userDepth=0;target.handZoom=0;target.fx=target.fy=0;netMsg="VISTA RESTABLECIDA"});
+setInterval(() => {
+  if (!demo) return;
+  if (forced) { if (forced === "speaking" && !params.has("level")) target.level = 0.3 + 0.4 * Math.abs(Math.sin(T * 7)) * Math.abs(Math.sin(T * 2.3)); return; }
+  let t = T % SEQ.reduce((a, s) => a + s[1], 0), m = "idle";
+  for (const [name, dd] of SEQ) { if (t < dd) { m = name; break; } t -= dd; }
+  target.mode = m;
+  target.level = m === "speaking" ? 0.3 + 0.5 * Math.abs(Math.sin(T * 6.5)) * Math.abs(Math.sin(T * 2.1)) : m === "listening" ? 0.15 + 0.25 * Math.abs(Math.sin(T * 5)) : 0;
+}, 33);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

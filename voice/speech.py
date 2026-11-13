@@ -13,7 +13,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import math
 import os
+import random
+from array import array
+
+from core import visual_state
 
 # Se pueden cambiar desde el .env sin tocar el código:
 #   JARVIS_VOICE=es-EC-LuisNeural   JARVIS_VOICE_RATE=+4%   JARVIS_VOICE_PITCH=-3Hz
@@ -70,6 +75,38 @@ def _synthesize(sentence: str) -> Path | None:
     return None
 
 
+def _envelope(path: Path) -> list[float] | None:
+    """Volumen de la voz cada 50 ms (0..1), para que el núcleo visual lata con ella."""
+    try:
+        import pygame
+
+        sound = pygame.mixer.Sound(str(path))
+        init = pygame.mixer.get_init()
+        if not init or abs(init[1]) != 16:
+            return None
+        freq, _fmt, channels = init
+        raw = sound.get_raw()
+        samples = array("h")
+        samples.frombytes(raw[: len(raw) - len(raw) % 2])
+        window = max(1, int(freq * channels * 0.05))
+        values: list[float] = []
+        for start in range(0, len(samples), window):
+            chunk = samples[start : start + window : 4]
+            if chunk:
+                values.append(math.sqrt(sum(v * v for v in chunk) / len(chunk)))
+        peak = max(values, default=0.0)
+        if peak <= 0:
+            return None
+        return [min(1.0, (v / (peak * 0.85)) ** 0.8) for v in values]
+    except Exception:
+        return None
+
+
+def _prepare(sentence: str) -> tuple[Path | None, list[float] | None]:
+    path = _synthesize(sentence)
+    return (path, _envelope(path) if path is not None else None)
+
+
 def _ensure_mixer() -> bool:
     import pygame
 
@@ -79,13 +116,20 @@ def _ensure_mixer() -> bool:
         return bool(pygame.mixer.get_init())
 
 
-def _play(path: Path) -> None:
+def _play(path: Path, envelope: list[float] | None = None) -> None:
     import pygame
 
     pygame.mixer.music.load(str(path))
     pygame.mixer.music.play()
     while pygame.mixer.music.get_busy() and not _stop_event.is_set():
-        pygame.time.wait(40)
+        position = pygame.mixer.music.get_pos()
+        if envelope and position >= 0:
+            level = envelope[min(len(envelope) - 1, position // 50)]
+        else:  # sin análisis de audio: movimiento sintético parecido al habla
+            level = 0.25 + 0.5 * random.random()
+        visual_state.set_level(level)
+        pygame.time.wait(25)
+    visual_state.set_level(0.0)
     pygame.mixer.music.stop()
     pygame.mixer.music.unload()
 
@@ -103,33 +147,37 @@ def speak(text: str) -> None:
     if not sentences:
         return
     _stop_event.clear()
+    visual_state.set_mode("speaking")
     try:
         if not _ensure_mixer():
             print("No se pudo iniciar el audio.")
             return
-        future = _executor.submit(_synthesize, sentences[0])
+        future = _executor.submit(_prepare, sentences[0])
         for index in range(len(sentences)):
             if _stop_event.is_set():
                 break
-            audio_path = future.result()
+            audio_path, envelope = future.result()
             # Empieza a generar la siguiente frase mientras suena esta.
             if index + 1 < len(sentences):
-                future = _executor.submit(_synthesize, sentences[index + 1])
+                future = _executor.submit(_prepare, sentences[index + 1])
             if audio_path is None:
                 continue
             try:
-                _play(audio_path)
+                _play(audio_path, envelope)
             finally:
                 audio_path.unlink(missing_ok=True)
         else:
             return
         # Si se interrumpió, descarta la generación pendiente.
         if not future.cancel():
-            leftover = future.result()
+            leftover, _ = future.result()
             if leftover is not None:
                 leftover.unlink(missing_ok=True)
     except Exception as exc:
         print(f"No se pudo reproducir la voz: {type(exc).__name__}: {exc}")
+    finally:
+        visual_state.set_level(0.0)
+        visual_state.set_mode("idle")
 
 
 def stop_speaking() -> None:

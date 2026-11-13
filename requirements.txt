@@ -14,3 +14,4 @@ vosk
 SQLAlchemy
 PyMySQL
 psycopg[binary]
+opencv-python>=4.8,<5

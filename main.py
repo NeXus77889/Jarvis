@@ -20,12 +20,38 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="JARVIS personal assistant")
     parser.add_argument("--voice", action="store_true", help="Use microphone and speech output")
     parser.add_argument("--gui", action="store_true", help="Open the desktop HUD")
+    parser.add_argument(
+        "--core",
+        action="store_true",
+        help="Voz + núcleo visual 3D en el navegador (implica --voice)",
+    )
+    parser.add_argument("--no-camera", action="store_true", help="Sin rastreo facial en --core")
     args = parser.parse_args()
     brain = JarvisBrain()
+    tracker = None
+    if args.core:
+        args.voice = True
+        from visual.server import start as start_core
+
+        _server, url = start_core()
+        print(f"Núcleo visual: {url}  (pulsa F11 en el navegador para pantalla completa)")
+        if not args.no_camera:
+            from visual.face_tracker import FaceTracker
+
+            tracker = FaceTracker()
+            tracker.start()
     if args.gui:
         from interface.hud import run_hud
 
         raise SystemExit(run_hud(brain))
+
+    if args.voice:
+        def approve_local_action(prompt: str) -> bool:
+            print(f"\n[Permiso requerido por JARVIS]\n{prompt}")
+            answer = input("¿Autorizar? [s/N]: ").strip().lower()
+            return answer in {"s", "si", "sí", "y", "yes"}
+
+        brain.tool_approval = approve_local_action
 
     def handle(message: str, speech_output: bool = False) -> str:
         local_output = speak if speech_output else lambda text: print(f"JARVIS: {text}")
@@ -34,7 +60,11 @@ def main() -> None:
         return brain.ask(message)
 
     if args.voice:
-        listen_loop(lambda message: handle(message, True), speak)
+        try:
+            listen_loop(lambda message: handle(message, True), speak)
+        finally:
+            if tracker is not None:
+                tracker.stop()
         return
     print("JARVIS listo. Escriba 'salir' para cerrar.")
     while True:
