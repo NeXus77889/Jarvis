@@ -1,0 +1,17 @@
+google-genai
+httpx
+SpeechRecognition
+aiohttp
+edge-tts
+pygame
+pyautogui
+screeninfo
+PyAudio
+PyQt5
+groq
+psutil
+vosk
+SQLAlchemy
+PyMySQL
+psycopg[binary]
+opencv-python>=4.8,<5
