@@ -167,6 +167,22 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(provider.chat([{"role": "user", "content": "test"}]), "mock response")
         self.assertEqual(request_params["model"], provider.model)
 
+    def test_groq_provider_reads_environment_key_and_passes_it_to_client(self) -> None:
+        client = object()
+        received: dict[str, object] = {}
+
+        def create_client(**kwargs: object) -> object:
+            received.update(kwargs)
+            return client
+
+        groq_module = SimpleNamespace(Groq=create_client)
+        with patch.dict("os.environ", {"GROQ_API_KEY": "injected-key"}):
+            provider = GroqAIProvider()
+            with patch.dict("sys.modules", {"groq": groq_module}):
+                self.assertIs(provider._get_client(), client)
+
+        self.assertEqual(received["api_key"], "injected-key")
+
     def test_groq_provider_maps_structured_tool_calls(self) -> None:
         call = SimpleNamespace(
             id="call-1",

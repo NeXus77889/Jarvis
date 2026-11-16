@@ -6,29 +6,42 @@ frases y mientras se reproduce una frase ya se está generando la siguiente.
 
 from __future__ import annotations
 
-import asyncio
-import re
-import tempfile
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-
 import math
 import os
 import random
+import re
+import tempfile
+import threading
+import wave
 from array import array
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from core import visual_state
 
-# Se pueden cambiar desde el .env sin tocar el código:
-#   JARVIS_VOICE=es-EC-LuisNeural   JARVIS_VOICE_RATE=+4%   JARVIS_VOICE_PITCH=-3Hz
-DEFAULT_VOICE = "es-EC-LuisNeural"  # acento ecuatoriano, más natural para tu público
-FALLBACK_VOICES = ("es-MX-JorgeNeural", "es-ES-AlvaroNeural")
+RUTA_MODELO = Path("voice") / "es_ES-davefx-medium.onnx"
 
 _stop_event = threading.Event()
 _mixer_lock = threading.Lock()
+_voice_lock = threading.Lock()
+_piper_voice = None
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jarvis-tts")
 _SENTENCE = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def _get_piper_voice():
+    """Carga el modelo .onnx una sola vez en memoria para evitar latencia."""
+    global _piper_voice
+    if _piper_voice is None:
+        with _voice_lock:
+            if _piper_voice is None:
+                from piper.voice import PiperVoice
+
+                model_path = Path(os.getenv("JARVIS_VOICE", str(RUTA_MODELO)))
+                if not model_path.exists():
+                    raise FileNotFoundError(f"No se encontró el modelo en: {model_path.resolve()}")
+                _piper_voice = PiperVoice.load(str(model_path))
+    return _piper_voice
 
 
 def _clean(text: str) -> str:
@@ -50,28 +63,28 @@ def split_sentences(text: str, max_chars: int = 220) -> list[str]:
 
 
 def _synthesize(sentence: str) -> Path | None:
-    """Genera un MP3 temporal. Devuelve None si no hay red o falla."""
-    import edge_tts
-
-    rate = os.getenv("JARVIS_VOICE_RATE", "+3%")
-    pitch = os.getenv("JARVIS_VOICE_PITCH", "-2Hz")
-    voices = (os.getenv("JARVIS_VOICE", DEFAULT_VOICE), *FALLBACK_VOICES)
-
-    async def generate(voice: str, target: str) -> None:
-        await edge_tts.Communicate(sentence, voice, rate=rate, pitch=pitch).save(target)
-
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+    """Genera un WAV temporal usando Piper TTS local."""
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
         path = Path(handle.name)
-    last_error: Exception | None = None
-    for voice in voices:
-        try:
-            asyncio.run(generate(voice, str(path)))
-            if path.stat().st_size > 0:
-                return path
-        except Exception as exc:  # voz inexistente o sin red: prueba la siguiente
-            last_error = exc
+
+    try:
+        voice = _get_piper_voice()
+        with wave.open(str(path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(voice.config.sample_rate)
+
+            if hasattr(voice, "synthesize_wav"):
+                voice.synthesize_wav(sentence, wav_file)
+            else:
+                voice.synthesize(sentence, wav_file)
+
+        if path.stat().st_size > 44:  # Más que solo la cabecera WAV vacía
+            return path
+    except Exception as exc:
+        print(f"No se pudo generar la voz con Piper: {type(exc).__name__}: {exc}")
+
     path.unlink(missing_ok=True)
-    print(f"No se pudo generar la voz: {type(last_error).__name__}: {last_error}")
     return None
 
 
@@ -137,7 +150,7 @@ def _play(path: Path, envelope: list[float] | None = None) -> None:
 def speak(text: str) -> None:
     print(f"\n[JARVIS]: {text}")
     try:
-        import edge_tts  # noqa: F401
+        import piper  # noqa: F401
         import pygame  # noqa: F401
     except ImportError as exc:
         print(f"Voz no disponible: falta una dependencia ({exc.name}).")

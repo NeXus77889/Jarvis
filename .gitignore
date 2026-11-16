@@ -6,3 +6,6 @@ storage/memory/*.db
 storage/memory/*.db-shm
 storage/memory/*.db-wal
 storage/logs/
+storage/tts/
+storage/voices/
+/prueba*.wav

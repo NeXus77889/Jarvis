@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Iterator
 from typing import Protocol
@@ -28,23 +29,27 @@ class GroqAIProvider:
         max_tokens: int | None = None,
         client: object | None = None,
     ):
-        self.api_key = (settings.groq_api_key if api_key is None else api_key).strip()
+        groq_api_key = os.getenv("GROQ_API_KEY") if api_key is None else api_key
+        self.api_key = (groq_api_key or "").strip()
         self.model = model or settings.groq_model
         self.max_tokens = max_tokens or settings.max_response_tokens
         self._client = client
 
     def _get_client(self) -> object:
         if not self.api_key:
-            raise AIProviderError(
+            error = (
                 "Groq no está configurado. Añada una clave nueva a la variable GROQ_API_KEY "
                 "o al archivo .env para habilitar las respuestas de IA."
             )
+            logger.error(error)
+            raise AIProviderError(error)
         if self._client is None:
             try:
                 from groq import Groq
             except ImportError as exc:
                 raise AIProviderError("Falta el paquete groq; instale requirements.txt.") from exc
-            self._client = Groq(api_key=self.api_key, timeout=30.0, max_retries=0)
+            groq_api_key = self.api_key
+            self._client = Groq(api_key=groq_api_key, timeout=30.0, max_retries=0)
         return self._client
 
     def chat(self, messages: list[dict[str, str]]) -> str:

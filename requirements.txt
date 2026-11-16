@@ -3,6 +3,7 @@ httpx
 SpeechRecognition
 aiohttp
 edge-tts
+piper-tts
 pygame
 pyautogui
 screeninfo
